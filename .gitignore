@@ -23,6 +23,7 @@
 !source/
 /source/**
 !/source/**/
+!/source/**/.gitkeep
 
 # script/ folder: track all files
 !script/
@@ -31,3 +32,4 @@
 !output/
 /output/**
 !/output/**/
+!/output/**/.gitkeep
