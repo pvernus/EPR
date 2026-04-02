@@ -28,5 +28,7 @@
 # script/ folder: track all files
 !script/
 
-# output/ folder: fully ignored
-/output/
+# output/ folder: visible on GitHub as empty (root .gitkeep only, contents ignored)
+!output/
+/output/**
+!/output/.gitkeep

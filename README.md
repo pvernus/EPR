@@ -1,4 +1,4 @@
-# EPR ADM-2 Political Status Panel
+# GeoEPR ADM-2 Panel
 
 This folder contains the script and outputs for a balanced ADM-2 × year panel of ethnic group political status, covering 2000–2023.
 
