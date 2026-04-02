@@ -1,0 +1,20 @@
+# === WHITELIST — only explicitly allowed files are tracked ===
+
+# Ignore everything at root level
+/*
+
+# Root files to track
+!.gitignore
+!GODAD.Rproj
+!README.md
+
+# Root folders to track (all contents)
+!CerdiSeminar/
+!paper/
+
+# data/ folder: track .gitkeep (forces data/ to appear as its own folder) and .qmd files
+!data/
+/data/**
+!/data/.gitkeep
+!/data/**/
+!/data/**/*.qmd
