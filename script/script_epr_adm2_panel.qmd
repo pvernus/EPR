@@ -1,0 +1,899 @@
+---
+title: "ADM-2 × Year EPR Political Status Panel"
+format: html
+---
+
+```{r setup}
+# No stochastic operations in this script; parallel workers use future.seed = TRUE.
+if (!require("pacman")) install.packages("pacman", repos = "https://cran.r-project.org")
+
+pacman::p_load(
+  here,
+  tidyverse,
+  janitor,
+  sf,
+  terra,
+  exactextractr,
+  units,
+  future,
+  future.apply
+)
+
+```
+
+```{r constants}
+# Disable S2 spherical geometry engine — use planar GEOS instead.
+# S2 is stricter about self-intersecting rings (common in global datasets like GeoEPR).
+sf::sf_use_s2(FALSE)
+
+# Parallelism: multisession works on all platforms (including Windows).
+# Detect cores; leave one free for the OS.
+n_cores <- max(1L, parallel::detectCores() - 1L)
+plan(multisession, workers = n_cores)
+cat("Parallel workers:", n_cores, "\n")
+
+YEAR_START     <- 2000L
+YEAR_END       <- 2023L
+RC1_CHECK_YEAR <- 2010L
+
+# ── Data paths — relative to project root via here::here() ───────────────────
+GADM_PATH     <- here::here("EPR/source/gadm_410_adm2_clean.gpkg")
+EPR_PATH      <- here::here("EPR/source/EPR/EPR-2023.csv")
+GEOEPR_PATH   <- here::here("EPR/source/EPR/GeoEPR-2023.geojson")
+WORLDPOP_PATH <- here::here("EPR/source/WorldPop/ppp_2000_1km_Aggregated.tif")
+
+low_status  <- c("DISCRIMINATED", "POWERLESS")
+high_status <- c("MONOPOLY", "DOMINANT", "SENIOR PARTNER")
+
+mollweide_crs <- st_crs("+proj=moll +lon_0=0 +x_0=0 +y_0=0 +datum=WGS84 +units=m +no_defs")
+
+# ── Caching: skip expensive recomputation on re-render ───────────────────────
+# Set FORCE_RECOMPUTE = TRUE to bust the cache and rerun from scratch.
+FORCE_RECOMPUTE <- FALSE
+CACHE_LINKS <- here::here("EPR", "output", "cache_adm2_spell_links.rds")
+CACHE_ISECT <- here::here("EPR", "output", "cache_spell_intersections_sf.rds")
+CACHE_POP   <- here::here("EPR", "output", "cache_pop_overlap.rds")
+
+# ── Expensive robustness check flag ─────────────────────────────────────────
+# RC1 reruns two full st_join() passes (WGS84 + Mollweide). Already confirmed
+# stable (4 ADM-2 units differ). Set TRUE only to re-validate after data changes.
+RUN_EXPENSIVE_RCS <- FALSE
+```
+
+## Step 1: Load GADM ADM-2
+
+```{r load-gadm}
+adm2 <- st_read(GADM_PATH, quiet = TRUE)
+cat("GADM ADM-2:", nrow(adm2), "units\n")
+cat("CRS:", st_crs(adm2)$input, "\n")
+```
+
+## Step 2: Load EPR + GeoEPR
+
+```{r load-epr}
+epr_data    <- readr::read_csv(EPR_PATH,    show_col_types = FALSE)
+geoepr_data <- sf::st_read(GEOEPR_PATH, quiet = TRUE)
+
+cat("EPR rows:", nrow(epr_data), "| GeoEPR rows:", nrow(geoepr_data), "\n")
+cat("EPR status values:\n"); print(table(epr_data$status))
+cat("GeoEPR CRS:", st_crs(geoepr_data)$input, "\n")
+```
+
+```{r expand-epr-yearly}
+# Expand EPR Core to yearly panel — this gives us status per gwgroupid × year.
+# GeoEPR does NOT need yearly expansion; spell polygons are used directly for
+# the spatial join (see Step 4).
+expand_yearly <- function(df, year_start, year_end) {
+  df |>
+    dplyr::filter(to >= year_start, from <= year_end) |>
+    dplyr::mutate(
+      year_from = pmax(as.integer(from), year_start),
+      year_to   = pmin(as.integer(to),   year_end),
+      year      = purrr::map2(year_from, year_to, seq)
+    ) |>
+    tidyr::unnest(year) |>
+    dplyr::select(-year_from, -year_to)
+}
+
+epr_yearly <- expand_yearly(epr_data, YEAR_START, YEAR_END)
+cat("EPR yearly rows:", nrow(epr_yearly),
+    "| years:", paste(range(epr_yearly$year), collapse = "-"), "\n")
+
+# Coverage diagnostic: EPR groups without GeoEPR geometry
+epr_ids    <- distinct(epr_data,    gwgroupid)
+geoepr_ids <- geoepr_data |> st_drop_geometry() |> distinct(gwgroupid)
+epr_only   <- anti_join(epr_ids, geoepr_ids, by = "gwgroupid")
+cat("EPR groups without GeoEPR geometry (lost from overlay):", nrow(epr_only), "\n")
+if (nrow(epr_only) > 0) {
+  epr_data |>
+    filter(gwgroupid %in% epr_only$gwgroupid) |>
+    select(any_of(c("gwgroupid", "group", "statename", "status", "from", "to"))) |>
+    distinct() |> arrange(gwgroupid) |> print(n = 10)
+}
+```
+
+## Coverage Audit — Phase 1: Characterize Missing Groups
+
+```{r coverage-phase1}
+cat(sprintf("=== COVERAGE AUDIT — Phase 1: %d EPR groups without GeoEPR polygon ===\n\n",
+            nrow(epr_only)))
+
+# Full profile of missing groups using all available EPR columns
+epr_missing <- epr_data |>
+  filter(gwgroupid %in% epr_only$gwgroupid) |>
+  select(any_of(c("gwgroupid", "group", "statename", "status",
+                  "from", "to", "size", "reg_aut", "umbrella"))) |>
+  distinct()
+
+# Unique groups (not spells)
+missing_groups <- epr_missing |>
+  distinct(gwgroupid, group, statename)
+cat("Unique groups without geometry:", nrow(missing_groups), "\n\n")
+
+# Summary by EPR status
+cat("--- By EPR status (spell-level) ---\n")
+epr_missing |>
+  count(status, sort = TRUE) |>
+  print()
+
+# Summary by country
+cat("\n--- By country (top 20) ---\n")
+missing_groups |>
+  count(statename, sort = TRUE) |>
+  print(n = 20)
+
+# Bias assessment: do any excluded groups ever hold DISCRIMINATED / POWERLESS status?
+cat("\n--- Bias assessment ---\n")
+bias_check <- epr_missing |>
+  group_by(gwgroupid, group, statename) |>
+  summarise(
+    has_low_status  = any(status %in% low_status),
+    has_high_status = any(status %in% high_status),
+    .groups = "drop"
+  )
+
+cat("Groups with ≥1 spell in {DISCRIMINATED, POWERLESS}:",
+    sum(bias_check$has_low_status), "/", nrow(bias_check),
+    sprintf("(%.0f%%)\n", mean(bias_check$has_low_status) * 100))
+cat("Groups with ≥1 spell in {MONOPOLY, DOMINANT, SENIOR PARTNER}:",
+    sum(bias_check$has_high_status), "/", nrow(bias_check),
+    sprintf("(%.0f%%)\n", mean(bias_check$has_high_status) * 100))
+
+cat("\nIf the 153 are overwhelmingly dispersed (non-regional) groups,",
+    "their exclusion is expected by GeoEPR design — not a coverage error.\n")
+cat("If some are regionally based with low status, their exclusion could",
+    "downward-bias EPR_low_bin in affected countries.\n")
+
+# Save full group list for inspection
+csv_path <- here::here("EPR", "output", "epr_groups_no_geometry.csv")
+epr_missing |>
+  arrange(gwgroupid, from) |>
+  write_csv(csv_path)
+cat("\nSaved:", csv_path, "\n")
+```
+
+## Step 3: CRS Alignment and Geometry Validation
+
+```{r crs-align}
+target_crs <- st_crs(4326)
+
+if (st_crs(adm2) != target_crs) {
+  cat("Reprojecting GADM to WGS84...\n")
+  adm2 <- st_transform(adm2, target_crs)
+}
+if (st_crs(geoepr_data) != target_crs) {
+  cat("Reprojecting GeoEPR to WGS84...\n")
+  geoepr_data <- st_transform(geoepr_data, target_crs)
+}
+
+n_inv_adm2   <- sum(!st_is_valid(adm2))
+n_inv_geoepr <- sum(!st_is_valid(geoepr_data))
+cat("Invalid GADM geometries:", n_inv_adm2, "\n")
+cat("Invalid GeoEPR geometries:", n_inv_geoepr, "\n")
+if (n_inv_adm2   > 0) adm2        <- st_make_valid(adm2)
+if (n_inv_geoepr > 0) geoepr_data <- st_make_valid(geoepr_data)
+```
+
+## Coverage Audit — Phase 1b: GeoEPR Geometry Changes Across Spells
+
+```{r coverage-phase1b}
+cat("=== COVERAGE AUDIT — Phase 1b: Do GeoEPR groups change geometry across spells? ===\n\n")
+
+# Compute area + centroid as a geometry fingerprint per spell
+geoepr_fingerprint <- geoepr_data |>
+  mutate(
+    spell_area_km2 = suppressWarnings(as.numeric(st_area(geometry))) / 1e6,
+    cx = suppressWarnings(st_coordinates(st_centroid(geometry))[, 1]),
+    cy = suppressWarnings(st_coordinates(st_centroid(geometry))[, 2])
+  ) |>
+  st_drop_geometry() |>
+  select(gwgroupid, from, to, spell_area_km2, cx, cy)
+
+# Per group: count distinct area + centroid combinations across spells
+geom_stability <- geoepr_fingerprint |>
+  group_by(gwgroupid) |>
+  summarise(
+    n_spells           = n(),
+    n_distinct_areas   = n_distinct(round(spell_area_km2, 1)),
+    n_distinct_centers = n_distinct(paste(round(cx, 3), round(cy, 3))),
+    .groups = "drop"
+  ) |>
+  mutate(geometry_changes = n_distinct_areas > 1 | n_distinct_centers > 1)
+
+cat("Total GeoEPR groups:                     ", nrow(geom_stability), "\n")
+cat("  Single-spell groups:                   ", sum(geom_stability$n_spells == 1), "\n")
+cat("  Multi-spell groups:                    ", sum(geom_stability$n_spells > 1), "\n")
+cat("  Multi-spell with CHANGING geometry:    ",
+    sum(geom_stability$geometry_changes), "\n")
+cat("  Multi-spell with STABLE geometry:      ",
+    sum(geom_stability$n_spells > 1 & !geom_stability$geometry_changes), "\n")
+
+# Are geometry changes handled by the current script?
+cat("\n--- Assessment ---\n")
+cat("The script joins at spell level (geoepr_spells retains from/to per polygon).\n")
+cat("Each spell's geometry is used independently in the st_join, so groups with\n")
+cat("changing geometries ARE captured correctly — their ADM-2 intersections can\n")
+cat("differ across time periods, and the tabular year expansion (Step 5) propagates\n")
+cat("each spell's ADM-2 links only within its [from, to] interval.\n")
+
+if (sum(geom_stability$geometry_changes) > 0) {
+  cat("\nSample of groups with geometry changes across spells:\n")
+  geom_stability |>
+    filter(geometry_changes) |>
+    arrange(desc(n_spells)) |>
+    print(n = 10)
+}
+```
+
+## Step 4: Precomputed Spatial Join (runs once)
+
+```{r precompute-links}
+# ── Strategy ─────────────────────────────────────────────────────────────────
+# Old approach: st_union + st_intersects called 48× (24 years × 2 statuses).
+# New approach: one st_join against the ~1684 raw GeoEPR spell polygons.
+#   The ADM-2 × GeoEPR spatial relationship is fixed within each spell —
+#   no need to recompute per year. All yearly logic is then tabular.
+
+if (!FORCE_RECOMPUTE && file.exists(CACHE_LINKS)) {
+  cat("Loading cached spell links...\n")
+  adm2_spell_links <- readRDS(CACHE_LINKS)
+} else {
+  cat("Precomputing ADM-2 × GeoEPR spell links...\n")
+
+  # Keep only the columns we need from GeoEPR spells
+  geoepr_spells <- geoepr_data |> select(gwgroupid, from, to)
+
+  # st_join: for each ADM-2 polygon, find all GeoEPR spell polygons it intersects.
+  # left = FALSE drops ADM-2 units with zero EPR coverage (added back as 0 later).
+  adm2_spell_links <- st_join(
+    adm2 |> select(gid_adm2),
+    geoepr_spells,
+    join = st_intersects,
+    left = FALSE
+  ) |>
+    st_drop_geometry() |>
+    as_tibble()
+
+  saveRDS(adm2_spell_links, CACHE_LINKS)
+  cat("Cached:", CACHE_LINKS, "\n")
+}
+
+cat("Spell links found:", nrow(adm2_spell_links),
+    "(ADM-2 × GeoEPR spell intersections)\n")
+cat("Unique ADM-2 units with any EPR overlap:",
+    n_distinct(adm2_spell_links$gid_adm2), "\n")
+cat("Unique GeoEPR spells matched:",
+    n_distinct(paste(adm2_spell_links$gwgroupid, adm2_spell_links$from)), "\n")
+```
+
+## Step 4b: Intersection Areas (Mollweide, runs once)
+
+```{r compute-areas}
+# Compute overlap_pct = int_area / adm2_area for every (ADM-2, GeoEPR spell) pair.
+# Used in Step 5 to build continuous EPR variables AND reused by RC2 for threshold checks.
+# Running in the main pipeline avoids duplicating the heavy pmap_dfr loop in RC2.
+
+# ── Project to Mollweide (equal-area) — always needed ────────────────────────
+adm2_moll <- adm2 |> sf::st_transform(mollweide_crs)
+adm2_moll$adm2_area_m2 <- as.numeric(sf::st_area(adm2_moll))
+adm2_moll <- adm2_moll |> dplyr::select(gid_adm2, adm2_area_m2)
+
+geoepr_moll <- geoepr_data |>
+  sf::st_transform(mollweide_crs) |>
+  dplyr::select(gwgroupid, from, to)
+
+if (!FORCE_RECOMPUTE && file.exists(CACHE_ISECT)) {
+  cat("Loading cached spell intersections...\n")
+  spell_intersections_sf <- readRDS(CACHE_ISECT)
+} else {
+  cat("Computing intersection areas in Mollweide (vectorized, runs once)...\n")
+
+  # Subset adm2_moll to only units with any EPR overlap — reduces size before join.
+  adm2_subset <- adm2_moll |>
+    dplyr::filter(gid_adm2 %in% adm2_spell_links$gid_adm2) |>
+    sf::st_make_valid()
+
+  geoepr_moll_valid <- geoepr_moll |> sf::st_make_valid()
+
+  # Single vectorized intersection — replaces the serial pmap() loop (~740 iters).
+  # GEOS uses an STR-tree spatial index: O((n+m) log(n+m)) vs 740 separate calls.
+  spell_intersections_sf <- suppressWarnings(
+    sf::st_intersection(adm2_subset, geoepr_moll_valid)
+  )
+  # Remove empty geometries; bracket subsetting avoids assuming a geometry column name.
+  spell_intersections_sf <- spell_intersections_sf[!sf::st_is_empty(spell_intersections_sf), ]
+  # Extract polygon parts from any GEOMETRYCOLLECTION results.
+  spell_intersections_sf <- sf::st_collection_extract(spell_intersections_sf, "POLYGON")
+  spell_intersections_sf <- dplyr::mutate(spell_intersections_sf,
+      int_area_m2 = as.numeric(sf::st_area(spell_intersections_sf)),
+      overlap_pct = int_area_m2 / adm2_area_m2
+    ) |>
+    dplyr::rename(spell_from = from, spell_to = to) |>
+    dplyr::select(gid_adm2, gwgroupid, spell_from, spell_to, overlap_pct)
+  # Geometry retained intentionally — needed by Step 4c for population extraction.
+
+  saveRDS(spell_intersections_sf, CACHE_ISECT)
+  cat("Cached:", CACHE_ISECT, "\n")
+}
+
+# Split into two objects with distinct purposes:
+#   spell_intersections      — tabular (no geometry), used for area-based EPR_*_pct in Step 5
+#   spell_intersection_geoms — sf with geometry, used for pop zonal extraction in Step 4c
+# Splitting avoids carrying large geometry through the tabular pipeline unnecessarily.
+spell_intersections      <- spell_intersections_sf |> sf::st_drop_geometry()
+spell_intersection_geoms <- spell_intersections_sf  # keep sf class
+rm(spell_intersections_sf)                          # free the intermediate object
+
+cat("Spell intersections computed:", nrow(spell_intersections), "\n")
+```
+
+## Step 4c: Population-Weighted Overlap (WorldPop, year 2000)
+
+```{r compute-pop-weights}
+# ── Why WorldPop year 2000? ───────────────────────────────────────────────────
+# We anchor population weights to year 2000 (the panel start) for two reasons:
+#   1. Avoids endogeneity: population shifts over 2000–2023 may partly respond to
+#      political exclusion itself (e.g., displacement, migration), so using a
+#      fixed baseline prevents the weight from being contaminated by the outcome.
+#   2. Consistency: the political-salience variable applies to the full panel;
+#      using a fixed population grid makes the denominator stable across years,
+#      so changes in EPR_*_pop_pct reflect changes in political status, not
+#      changes in population distribution.
+# Source: WorldPop "Estimated total number of people per grid-cell" (2000),
+# 30 arc-second resolution (~1 km at equator), WGS84, units = people per pixel.
+
+if (!FORCE_RECOMPUTE && file.exists(CACHE_POP)) {
+  cat("Loading cached population-weighted overlap...\n")
+  pop_overlap <- readRDS(CACHE_POP)
+  rm(spell_intersection_geoms); gc()
+} else {
+  cat("Loading WorldPop year 2000 raster...\n")
+  pop_rast <- terra::rast(WORLDPOP_PATH)
+  cat("Loaded:", basename(WORLDPOP_PATH),
+      "| CRS:", terra::crs(pop_rast, describe = TRUE)$name,
+      "| Resolution:", paste(round(terra::res(pop_rast), 5), collapse = " x "), "deg\n")
+
+  # ── Reproject ADM-2 to raster CRS for exact_extract ────────────────────────
+  # exact_extract requires vector and raster in the same CRS.
+  # WorldPop is WGS84; adm2 is also WGS84 — the transform is a no-op but kept
+  # explicit so the code is robust if the raster CRS ever changes.
+  adm2_for_pop <- adm2 |> sf::st_transform(terra::crs(pop_rast))
+
+  # ── Denominator: total population per ADM-2 unit ───────────────────────────
+  # exact_extract sums raster cell values weighted by fractional cell coverage,
+  # giving correct totals even for cells that straddle polygon boundaries.
+  cat("Extracting ADM-2 total population (denominator)...\n")
+  adm2_for_pop$adm2_pop <- exactextractr::exact_extract(
+    pop_rast, adm2_for_pop, fun = "sum", progress = TRUE
+  )
+
+  # ── Diagnose zero-population ADM-2 units ───────────────────────────────────
+  # Zero-pop units get pop_overlap_pct = 0 (division by zero prevention).
+  # We report them explicitly so the user can assess whether any are substantively
+  # important (e.g., small islands with EPR groups should appear as NA, not zero).
+  zero_pop <- adm2_for_pop |>
+    sf::st_drop_geometry() |>
+    dplyr::filter(adm2_pop == 0) |>
+    dplyr::select(dplyr::any_of(c("gid_adm2", "country", "iso3", "NAME_0", "GID_0")))
+  cat("ADM-2 units with zero WorldPop population (year 2000):", nrow(zero_pop), "\n")
+  if (nrow(zero_pop) > 0 && all(c("iso3", "country") %in% names(zero_pop))) {
+    zero_pop_country <- zero_pop |>
+      dplyr::count(iso3, country, name = "n_units") |>
+      dplyr::arrange(dplyr::desc(n_units))
+    print(head(zero_pop_country, 20))
+  }
+
+  # ── Reproject intersection polygons to raster CRS ──────────────────────────
+  # spell_intersection_geoms is in Mollweide (from Step 4b); WorldPop is WGS84.
+  spell_intersection_geoms <- spell_intersection_geoms |>
+    sf::st_transform(terra::crs(pop_rast))
+
+  # ── Drop non-polygon geometries ─────────────────────────────────────────────
+  # st_intersection() can return GEOMETRYCOLLECTION, LINESTRING, or POINT when
+  # two polygons share only an edge or corner. exact_extract() requires strictly
+  # polygonal features, so we extract polygon parts and discard degenerate results.
+  n_before <- nrow(spell_intersection_geoms)
+  # st_collection_extract("POLYGON") decomposes GEOMETRYCOLLECTION results into
+  # pure polygon features, discarding any degenerate point/line components that
+  # arise when two polygons share only an edge or corner.
+  spell_intersection_geoms <- sf::st_collection_extract(spell_intersection_geoms, "POLYGON")
+  cat("Non-polygon geometries dropped:",
+      n_before - nrow(spell_intersection_geoms),
+      "of", n_before, "intersection rows\n")
+
+  # ── Numerator: population within each (ADM-2 × GeoEPR spell) intersection ──
+  # Each row of spell_intersection_geoms is the polygon of the overlap between one
+  # ADM-2 unit and one GeoEPR group spell. Summing population within that polygon
+  # gives the number of people in the ADM-2 who live inside the group's territory.
+  cat("Extracting intersection population (numerator)...\n")
+  spell_intersection_geoms$int_pop <- exactextractr::exact_extract(
+    pop_rast, spell_intersection_geoms, fun = "sum", progress = TRUE
+  )
+
+  # ── Compute population overlap fraction ────────────────────────────────────
+  # pop_overlap_pct = people in (ADM-2 ∩ GeoEPR group) / total people in ADM-2.
+  # This is the population-weighted analogue of overlap_pct (area-based).
+  # Zero-pop units are set to 0, not NA, to keep the panel fully non-missing.
+  adm2_pop_lookup <- adm2_for_pop |>
+    sf::st_drop_geometry() |>
+    dplyr::select(gid_adm2, adm2_pop)
+
+  pop_overlap <- spell_intersection_geoms |>
+    sf::st_drop_geometry() |>
+    dplyr::select(gid_adm2, gwgroupid, spell_from, spell_to, int_pop) |>
+    dplyr::left_join(adm2_pop_lookup, by = "gid_adm2") |>
+    dplyr::mutate(
+      pop_overlap_pct = dplyr::if_else(adm2_pop > 0, int_pop / adm2_pop, 0)
+    )
+
+  saveRDS(pop_overlap, CACHE_POP)
+  cat("Cached:", CACHE_POP, "\n")
+
+  # ── Free large objects ──────────────────────────────────────────────────────
+  # spell_intersection_geoms (large sf) and the raster are no longer needed.
+  # Free them before building the panel to keep peak memory manageable.
+  rm(spell_intersection_geoms, pop_rast, adm2_for_pop)
+  gc()
+}
+
+cat("pop_overlap rows:", nrow(pop_overlap),
+    "| range pop_overlap_pct: [",
+    round(min(pop_overlap$pop_overlap_pct), 4), ",",
+    round(max(pop_overlap$pop_overlap_pct), 4), "]\n")
+```
+
+## Step 5: Build Balanced Panel
+
+```{r build-panel}
+# ── Expand spell links to yearly grain ───────────────────────────────────────
+adm2_group_years <- expand_yearly(adm2_spell_links, YEAR_START, YEAR_END) |>
+  select(gid_adm2, gwgroupid, year)
+
+# ── Join EPR status and aggregate — binary flags ──────────────────────────────
+flags_df <- adm2_group_years |>
+  left_join(
+    epr_yearly |> select(gwgroupid, year, status),
+    by = c("gwgroupid", "year")
+  ) |>
+  group_by(gid_adm2, year) |>
+  summarise(
+    EPR_low_bin  = as.integer(any(status %in% low_status,  na.rm = TRUE)),
+    EPR_high_bin = as.integer(any(status %in% high_status, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+# ── Continuous variables: % of ADM-2 area covered by low/high status groups ──
+# overlap_pct = int_area / adm2_area (from Step 4b).
+# Summed across same-status groups, capped at 1.
+continuous_df <- expand_yearly(
+    spell_intersections |> rename(from = spell_from, to = spell_to),
+    YEAR_START, YEAR_END
+  ) |>
+  select(gid_adm2, gwgroupid, year, overlap_pct) |>
+  left_join(epr_yearly |> select(gwgroupid, year, status),
+            by = c("gwgroupid", "year")) |>
+  group_by(gid_adm2, year) |>
+  summarise(
+    EPR_low_pct  = min(sum(overlap_pct[status %in% low_status],  na.rm = TRUE), 1),
+    EPR_high_pct = min(sum(overlap_pct[status %in% high_status], na.rm = TRUE), 1),
+    .groups = "drop"
+  )
+
+# ── Population-weighted continuous variables ──────────────────────────────────
+# Mirrors the area-based continuous_df above, but uses pop_overlap_pct instead of
+# overlap_pct as the weight. This measures the share of each ADM-2's *population*
+# living inside low/high-power group territories, rather than the area share.
+# Population weighting matters where groups are geographically concentrated in
+# dense urban areas (large pop share, small area share) or remote rural regions
+# (small pop share, large area share).
+pop_continuous_df <- expand_yearly(
+    pop_overlap |> rename(from = spell_from, to = spell_to),
+    YEAR_START, YEAR_END
+  ) |>
+  select(gid_adm2, gwgroupid, year, pop_overlap_pct) |>
+  left_join(epr_yearly |> select(gwgroupid, year, status),
+            by = c("gwgroupid", "year")) |>
+  group_by(gid_adm2, year) |>
+  summarise(
+    # Sum population shares across groups of the same status; cap at 1.
+    # Cap is needed because multiple groups can overlap the same ADM-2 population.
+    EPR_low_pop_pct  = min(sum(pop_overlap_pct[status %in% low_status],  na.rm = TRUE), 1),
+    EPR_high_pop_pct = min(sum(pop_overlap_pct[status %in% high_status], na.rm = TRUE), 1),
+    .groups = "drop"
+  )
+
+# ── Balanced panel ────────────────────────────────────────────────────────────
+panel <- expand_grid(
+  gid_adm2 = unique(adm2$gid_adm2),
+  year     = YEAR_START:YEAR_END
+) |>
+  left_join(flags_df,          by = c("gid_adm2", "year")) |>
+  left_join(continuous_df,     by = c("gid_adm2", "year")) |>
+  left_join(pop_continuous_df, by = c("gid_adm2", "year")) |>
+  mutate(
+    EPR_low_bin      = replace_na(EPR_low_bin,      0L),
+    EPR_high_bin     = replace_na(EPR_high_bin,     0L),
+    EPR_low_pct      = replace_na(EPR_low_pct,      0),
+    EPR_high_pct     = replace_na(EPR_high_pct,     0),
+    EPR_low_pop_pct  = replace_na(EPR_low_pop_pct,  0),
+    EPR_high_pop_pct = replace_na(EPR_high_pop_pct, 0)
+  )
+
+# Balance check
+n_units <- n_distinct(panel$gid_adm2)
+n_years <- n_distinct(panel$year)
+stopifnot("Panel is not balanced" = nrow(panel) == n_units * n_years)
+cat("PASS: Balanced panel —", n_units, "ADM-2 units ×",
+    n_years, "years =", nrow(panel), "rows\n")
+cat("Columns:", paste(names(panel), collapse = ", "), "\n")
+```
+
+## Step 6: Summary Statistics
+
+```{r summary-by-year}
+summary_year <- panel |>
+  group_by(year) |>
+  summarise(
+    n_units  = n(),
+    n_low    = sum(EPR_low_bin),
+    n_high   = sum(EPR_high_bin),
+    pct_low  = mean(EPR_low_bin) * 100,
+    pct_high = mean(EPR_high_bin) * 100,
+    .groups = "drop"
+  )
+cat("=== EPR flag coverage by year ===\n")
+print(summary_year, n = Inf)
+```
+
+```{r cross-tab}
+cat("\n=== ADM-2 × year cross-tabulation (pooled) ===\n")
+cat("Both low and high:", sum(panel$EPR_low_bin == 1 & panel$EPR_high_bin == 1), "\n")
+cat("Low only:         ", sum(panel$EPR_low_bin == 1 & panel$EPR_high_bin == 0), "\n")
+cat("High only:        ", sum(panel$EPR_low_bin == 0 & panel$EPR_high_bin == 1), "\n")
+cat("Neither:          ", sum(panel$EPR_low_bin == 0 & panel$EPR_high_bin == 0), "\n")
+
+cat("\n=== Continuous variables: EPR_low_pct / EPR_high_pct ===\n")
+cat("EPR_low_pct  — mean:", round(mean(panel$EPR_low_pct),  4),
+    "| median:", round(median(panel$EPR_low_pct),  4),
+    "| sd:", round(sd(panel$EPR_low_pct),  4),
+    "| % zeros:", round(mean(panel$EPR_low_pct  == 0) * 100, 1), "%\n")
+cat("EPR_high_pct — mean:", round(mean(panel$EPR_high_pct), 4),
+    "| median:", round(median(panel$EPR_high_pct), 4),
+    "| sd:", round(sd(panel$EPR_high_pct), 4),
+    "| % zeros:", round(mean(panel$EPR_high_pct == 0) * 100, 1), "%\n")
+
+# Consistency check: binary == 1 iff continuous > 0
+n_inconsistent_low  <- sum((panel$EPR_low_bin  == 1) != (panel$EPR_low_pct  > 0))
+n_inconsistent_high <- sum((panel$EPR_high_bin == 1) != (panel$EPR_high_pct > 0))
+cat("Consistency (bin==1 ↔ pct>0) — low inconsistencies:", n_inconsistent_low,
+    "| high:", n_inconsistent_high, "\n")
+
+cat("\n=== Population-weighted variables: EPR_low_pop_pct / EPR_high_pop_pct ===\n")
+cat("EPR_low_pop_pct  — mean:", round(mean(panel$EPR_low_pop_pct),  4),
+    "| median:", round(median(panel$EPR_low_pop_pct),  4),
+    "| sd:", round(sd(panel$EPR_low_pop_pct),  4),
+    "| % zeros:", round(mean(panel$EPR_low_pop_pct  == 0) * 100, 1), "%\n")
+cat("EPR_high_pop_pct — mean:", round(mean(panel$EPR_high_pop_pct), 4),
+    "| median:", round(median(panel$EPR_high_pop_pct), 4),
+    "| sd:", round(sd(panel$EPR_high_pop_pct), 4),
+    "| % zeros:", round(mean(panel$EPR_high_pop_pct == 0) * 100, 1), "%\n")
+
+# Correlation between area-based and population-based measures.
+# High correlation (> 0.7) confirms both capture similar underlying geography.
+# Divergence reveals areas where population is concentrated in group territories
+# that cover a small land area (e.g., urban ethnic enclaves), or vice versa.
+cat("\n=== Area vs. population-weighted correlation ===\n")
+cat("Cor(EPR_low_pct,  EPR_low_pop_pct): ",
+    round(cor(panel$EPR_low_pct,  panel$EPR_low_pop_pct),  3), "\n")
+cat("Cor(EPR_high_pct, EPR_high_pop_pct):",
+    round(cor(panel$EPR_high_pct, panel$EPR_high_pop_pct), 3), "\n")
+
+# Consistency check for pop-weighted variables: same logic as area-based.
+# If binary == 1 but pop_pct == 0, it means no one lives in the intersection
+# (uninhabited territory with a GeoEPR group polygon but zero GHSL population).
+# These are expected but should be few.
+n_incons_pop_low  <- sum((panel$EPR_low_bin  == 1) & (panel$EPR_low_pop_pct  == 0))
+n_incons_pop_high <- sum((panel$EPR_high_bin == 1) & (panel$EPR_high_pop_pct == 0))
+cat("Binary=1 but pop_pct=0 — low:", n_incons_pop_low,
+    "| high:", n_incons_pop_high,
+    "(expected: uninhabited group territories)\n")
+```
+
+```{r plot-time-trend}
+summary_year |>
+  select(year, pct_low, pct_high) |>
+  pivot_longer(c(pct_low, pct_high), names_to = "category", values_to = "pct") |>
+  mutate(category = case_match(category,
+    "pct_low"  ~ "Low power (Discriminated/Powerless)",
+    "pct_high" ~ "High power (Monopoly/Dominant/Senior Partner)"
+  )) |>
+  ggplot(aes(x = year, y = pct, color = category)) +
+  geom_line(linewidth = 0.8) + geom_point(size = 1.5) +
+  scale_color_manual(values = c("steelblue", "firebrick")) +
+  labs(title = "Share of ADM-2 units overlapping EPR group territories",
+       x = "Year", y = "% of ADM-2 units", color = NULL) +
+  theme_bw() + theme(legend.position = "bottom")
+```
+
+```{r map-sample-year}
+sample_year <- 2010L
+adm2 |>
+  select(gid_adm2) |>
+  left_join(panel |> filter(year == sample_year), by = "gid_adm2") |>
+  mutate(
+    epr_category = case_when(
+      EPR_low_bin == 1 & EPR_high_bin == 1 ~ "Both",
+      EPR_low_bin == 1                      ~ "Low power only",
+      EPR_high_bin == 1                     ~ "High power only",
+      TRUE                                  ~ "Neither"
+    ) |> factor(levels = c("Neither", "Low power only", "High power only", "Both"))
+  ) |>
+  ggplot() +
+  geom_sf(aes(fill = epr_category), color = NA) +
+  scale_fill_manual(
+    values = c("Neither" = "grey90", "Low power only" = "steelblue",
+               "High power only" = "firebrick", "Both" = "purple4"),
+    na.value = "grey80"
+  ) +
+  labs(title = paste("EPR political status overlay —", sample_year),
+       subtitle = "ADM-2 level", fill = NULL) +
+  theme_void() + theme(legend.position = "bottom")
+```
+
+## Step 7: Robustness Checks
+
+### RC1: CRS sensitivity
+
+```{r robustness-crs}
+# Re-run the precomputed spatial join in WGS84 and Mollweide in parallel.
+# Compare binary flags for a spot-check year to assess CRS sensitivity.
+# Gated by RUN_EXPENSIVE_RCS (default FALSE) — already confirmed: 4 units differ.
+
+if (!RUN_EXPENSIVE_RCS) {
+  cat("RC1 skipped (RUN_EXPENSIVE_RCS = FALSE).\n",
+      "Prior result: 4 ADM-2 units differ between WGS84 and Mollweide (CRS-insensitive).\n",
+      "Set RUN_EXPENSIVE_RCS <- TRUE in constants to re-validate.\n")
+} else {
+
+crs_variants <- list(
+  WGS84     = st_crs(4326),
+  Mollweide = mollweide_crs
+)
+
+# Export all objects needed by workers
+rc1_results <- future_lapply(crs_variants, function(crs) {
+  sf::sf_use_s2(FALSE)
+
+  adm2_proj   <- sf::st_transform(adm2, crs) |> dplyr::select(gid_adm2)
+  geoepr_proj <- sf::st_transform(geoepr_data, crs) |> dplyr::select(gwgroupid, from, to)
+
+  links <- sf::st_join(adm2_proj, geoepr_proj,
+                       join = sf::st_intersects, left = FALSE) |>
+    sf::st_drop_geometry() |>
+    dplyr::as_tibble()
+
+  links |>
+    dplyr::filter(to >= YEAR_START, from <= YEAR_END) |>
+    dplyr::mutate(
+      year_from = pmax(as.integer(from), YEAR_START),
+      year_to   = pmin(as.integer(to),   YEAR_END),
+      year      = purrr::map2(year_from, year_to, seq)
+    ) |>
+    tidyr::unnest(year) |>
+    dplyr::select(gid_adm2, gwgroupid, year) |>
+    dplyr::left_join(
+      epr_yearly |> dplyr::select(gwgroupid, year, status),
+      by = c("gwgroupid", "year")
+    ) |>
+    dplyr::group_by(gid_adm2, year) |>
+    dplyr::summarise(
+      EPR_low_bin  = as.integer(any(status %in% low_status,  na.rm = TRUE)),
+      EPR_high_bin = as.integer(any(status %in% high_status, na.rm = TRUE)),
+      .groups = "drop"
+    )
+}, future.seed = TRUE,
+   future.globals = list(
+     adm2 = adm2, geoepr_data = geoepr_data, epr_yearly = epr_yearly,
+     YEAR_START = YEAR_START, YEAR_END = YEAR_END,
+     low_status = low_status, high_status = high_status
+   ))
+
+# Compare for spot-check year
+yr_check <- RC1_CHECK_YEAR
+rc1_compare <- rc1_results[["WGS84"]] |>
+  dplyr::filter(year == yr_check) |>
+  dplyr::rename(low_wgs84 = EPR_low_bin, high_wgs84 = EPR_high_bin) |>
+  dplyr::left_join(
+    rc1_results[["Mollweide"]] |>
+      dplyr::filter(year == yr_check) |>
+      dplyr::rename(low_moll = EPR_low_bin, high_moll = EPR_high_bin),
+    by = "gid_adm2"
+  )
+
+cat("RC1 — CRS sensitivity (year", yr_check, "):\n")
+cat("  EPR_low_bin  differs:", sum(rc1_compare$low_wgs84  != rc1_compare$low_moll,  na.rm = TRUE), "ADM-2 units\n")
+cat("  EPR_high_bin differs:", sum(rc1_compare$high_wgs84 != rc1_compare$high_moll, na.rm = TRUE), "ADM-2 units\n")
+
+} # end if (RUN_EXPENSIVE_RCS)
+```
+
+### RC2: Area-weighted overlap threshold
+
+```{r robustness-area-threshold}
+# spell_intersections (overlap_pct = int_area / adm2_area) was precomputed
+# in Step 4b and is reused here. Just apply different thresholds in parallel.
+
+cat("RC2 reusing spell_intersections from Step 4b (", nrow(spell_intersections), "pairs ).\n")
+
+# Apply thresholds in parallel
+thresholds <- c(0, 0.05, 0.10, 0.25)
+
+rc2_results <- future_lapply(thresholds, function(thresh) {
+  adm2_group_years_area <- expand_yearly(
+      spell_intersections |>
+        dplyr::filter(overlap_pct >= thresh) |>
+        dplyr::rename(from = spell_from, to = spell_to),
+      YEAR_START, YEAR_END
+    ) |>
+    dplyr::select(gid_adm2, gwgroupid, year)
+
+  adm2_group_years_area |>
+    dplyr::left_join(
+      epr_yearly |> dplyr::select(gwgroupid, year, status),
+      by = c("gwgroupid", "year")
+    ) |>
+    dplyr::group_by(gid_adm2, year) |>
+    dplyr::summarise(
+      EPR_low_bin  = as.integer(any(status %in% low_status,  na.rm = TRUE)),
+      EPR_high_bin = as.integer(any(status %in% high_status, na.rm = TRUE)),
+      .groups = "drop"
+    )
+}, future.seed = TRUE,
+   future.globals = list(
+     expand_yearly = expand_yearly,
+     spell_intersections = spell_intersections, epr_yearly = epr_yearly,
+     YEAR_START = YEAR_START, YEAR_END = YEAR_END,
+     low_status = low_status, high_status = high_status
+   ))
+
+names(rc2_results) <- paste0("thresh_", thresholds)
+
+# Compare: how many flags change across thresholds?
+cat("\nRC2 — area threshold sensitivity (all years):\n")
+cat(sprintf("  %-12s  %8s  %9s\n", "Threshold", "n_low=1", "n_high=1"))
+for (nm in names(rc2_results)) {
+  r <- rc2_results[[nm]]
+  cat(sprintf("  %-12s  %8d  %9d\n", nm, sum(r$EPR_low_bin), sum(r$EPR_high_bin)))
+}
+```
+
+### RC3–RC5: Tabular checks
+
+```{r robustness-temporal-consistency}
+cat("\n=== RC3: Temporal consistency ===\n")
+temporal_check <- panel |>
+  arrange(gid_adm2, year) |>
+  group_by(gid_adm2) |>
+  summarise(
+    n_low_switches  = sum(abs(diff(EPR_low_bin))),
+    n_high_switches = sum(abs(diff(EPR_high_bin))),
+    .groups = "drop"
+  )
+cat("EPR_low_bin switches per unit:\n");  print(table(temporal_check$n_low_switches))
+cat("EPR_high_bin switches per unit:\n"); print(table(temporal_check$n_high_switches))
+cat("Units with >5 switches:", sum(temporal_check$n_low_switches > 5 |
+                                    temporal_check$n_high_switches > 5), "\n")
+```
+
+```{r robustness-mutual-exclusivity}
+cat("\n=== RC4: Coexistence (both flags = 1) ===\n")
+n_coexist <- sum(panel$EPR_low_bin == 1 & panel$EPR_high_bin == 1)
+cat("ADM-2 × year obs with both low and high:", n_coexist,
+    sprintf("(%.2f%% of panel)\n",
+            mean(panel$EPR_low_bin == 1 & panel$EPR_high_bin == 1) * 100))
+cat("Note: coexistence is expected — different groups in the same ADM-2\n",
+    "can simultaneously hold different political power statuses.\n")
+```
+
+```{r robustness-coverage}
+cat("\n=== RC5: EPR/GeoEPR coverage ===\n")
+geoepr_only <- anti_join(geoepr_ids, epr_ids, by = "gwgroupid")
+cat("EPR groups:", nrow(epr_ids),
+    "| GeoEPR groups:", nrow(geoepr_ids), "\n")
+cat("In EPR but not GeoEPR (lost from overlay):", nrow(epr_only), "\n")
+cat("In GeoEPR but not EPR (no status):", nrow(geoepr_only), "\n")
+```
+
+## Coverage Audit — Phase 2: Full Pipeline Attrition Table
+
+```{r coverage-phase2}
+cat("=== COVERAGE AUDIT — Phase 2: Group attrition across the full pipeline ===\n\n")
+
+# Stage 1: All unique EPR groups
+n1 <- n_distinct(epr_data$gwgroupid)
+
+# Stage 2: EPR groups with a GeoEPR polygon
+n2 <- n_distinct(geoepr_data$gwgroupid)
+
+# Stage 3: GeoEPR groups whose polygon intersects at least one ADM-2 unit.
+# adm2_spell_links is built with left = FALSE on the ADM-2 side, so only
+# (ADM-2, spell) pairs with a spatial intersection are retained. Groups
+# with a polygon that falls entirely outside GADM coverage do not appear.
+n3 <- n_distinct(adm2_spell_links$gwgroupid)
+
+# Stage 3 complement: groups with polygon but no ADM-2 intersection
+geoepr_no_adm2 <- anti_join(
+  geoepr_data |> st_drop_geometry() |> distinct(gwgroupid),
+  adm2_spell_links |> distinct(gwgroupid),
+  by = "gwgroupid"
+)
+cat("GeoEPR groups with polygon but no ADM-2 intersection:",
+    nrow(geoepr_no_adm2), "\n")
+
+# Stage 4: After temporal filter (2000–2023)
+n4 <- adm2_spell_links |>
+  filter(to >= YEAR_START, from <= YEAR_END) |>
+  pull(gwgroupid) |>
+  n_distinct()
+
+# Stage 5: Groups that appear in the panel with a non-NA EPR status
+n5 <- adm2_group_years |>
+  left_join(epr_yearly |> select(gwgroupid, year, status),
+            by = c("gwgroupid", "year")) |>
+  filter(!is.na(status)) |>
+  pull(gwgroupid) |>
+  n_distinct()
+
+attrition <- tibble(
+  Stage = c(
+    "1. EPR Core — all unique groups",
+    "2. With GeoEPR polygon (spatial coverage)",
+    "3. Polygon intersects ≥1 ADM-2 unit",
+    "4. Active in 2000–2023 (temporal filter)",
+    "5. With matched EPR status in panel"
+  ),
+  N = c(n1, n2, n3, n4, n5)
+) |>
+  mutate(
+    Lost_step    = c(NA_integer_, as.integer(lag(N)[-1] - N[-1])),
+    Pct_retained = round(N / first(N) * 100, 1)
+  )
+
+print(attrition, n = Inf)
+cat("\nNote: 'Lost_step' is loss at each transition; 'Pct_retained' is cumulative from Stage 1.\n")
+```
+
+## Step 8: Export
+
+```{r export}
+out_path <- here::here("EPR", "output", "adm2_epr_panel.rds")
+saveRDS(panel, out_path)
+cat("Saved:", out_path, "\n")
+cat("Dimensions:", nrow(panel), "rows ×", ncol(panel), "cols\n")
+glimpse(panel)
+
+# Shut down parallel workers
+plan(sequential)
+
+sessionInfo()
+```

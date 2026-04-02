@@ -18,3 +18,16 @@
 !/data/.gitkeep
 !/data/**/
 !/data/**/*.qmd
+
+# source/ folder: track sub-folder structure only, no files
+!source/
+/source/**
+!/source/**/
+
+# script/ folder: track all files
+!script/
+
+# output/ folder: track sub-folder structure only, no files
+!output/
+/output/**
+!/output/**/
