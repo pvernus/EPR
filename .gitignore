@@ -28,8 +28,5 @@
 # script/ folder: track all files
 !script/
 
-# output/ folder: track sub-folder structure only, no files
-!output/
-/output/**
-!/output/**/
-!/output/**/.gitkeep
+# output/ folder: fully ignored
+/output/
