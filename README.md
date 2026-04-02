@@ -31,7 +31,7 @@ This folder contains the script and outputs for a balanced ADM-2 × year panel o
 ## How to run
 
 ```bash
-quarto render data/EPR/script_epr_adm2_panel.qmd
+quarto render script/script_epr_adm2_panel.qmd
 ```
 
 **First run:** ~20–30 minutes (builds three cache files via spatial intersection and raster extraction). Subsequent renders complete in under a minute.
@@ -51,17 +51,14 @@ Developed and tested with:
 | exactextractr | 0.10.1 |
 | tidyverse | 2.0.0 |
 | future / future.apply | 1.69.0 / 1.20.2 |
-| priogrid | 3.0.1 (commit `dec8688`) |
 
 The rendered report includes a full `sessionInfo()` at the end for exact reproducibility auditing.
 
 ## Data sources
 
-| Dataset | Version | Path (local) |
-|---------|---------|--------------|
-| GADM | 4.10, ADM-2, cleaned | `$CHAP2_DATA_ROOT/GADM/gadm_410_adm2_clean.gpkg` |
-| EPR Core | via `priogrid` package | loaded from `$CHAP2_DATA_ROOT/EPR/` |
-| GeoEPR | via `priogrid` package | loaded from `$CHAP2_DATA_ROOT/EPR/` |
-| WorldPop | 2000, 1 km, aggregated | `$CHAP2_DATA_ROOT/WorldPop/ppp_2000_1km_Aggregated.tif` |
-
-`$CHAP2_DATA_ROOT` is set in `data/EPR/.Renviron` (machine-specific, not tracked by git).
+| Dataset | Version | Path (local) | Link |
+|---------|---------|--------------|------|
+| GADM | 4.10, ADM-2, cleaned | `source/gadm_410_adm2_clean.gpkg` | [gadm.org](https://gadm.org/data.html) |
+| EPR Core | 2023 | `source/EPR/EPR-2023.csv` | [icr.ethz.ch](https://icr.ethz.ch/data/epr/core/beta.html) |
+| GeoEPR | 2023 | `source/EPR/GeoEPR-2023.geojson` | [icr.ethz.ch](https://icr.ethz.ch/data/epr/geoepr/beta.html) |
+| WorldPop | 2000, 1 km, aggregated | `source/WorldPop/ppp_2000_1km_Aggregated.tif` | [worldpop.org](https://hub.worldpop.org/geodata/summary?id=24757) |
