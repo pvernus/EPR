@@ -1,0 +1,312 @@
+---
+title: "ADM-2 EPR Cross-Section"
+subtitle: "Time-invariant variables from the EPR panel (2000–2022)"
+date: today
+format:
+  html:
+    self-contained: true
+    toc: true
+    toc-depth: 2
+    theme: cosmo
+    code-fold: true
+execute:
+  warning: false
+  message: false
+---
+
+## Overview
+
+This script collapses the balanced ADM-2 × year panel (48,010 units × 23 years) into a
+**cross-section at the ADM-2 unit level**, computing time-invariant summaries of each
+unit's EPR exposure over 2000–2022.
+
+### Output variables
+
+| Variable | Type | Definition |
+|----------|------|-----------|
+| `always_low` | Binary | `EPR_low_bin == 1` in all 23 years |
+| `always_high` | Binary | `EPR_high_bin == 1` in all 23 years |
+| `never_low` | Binary | `EPR_low_bin == 0` in all 23 years |
+| `never_high` | Binary | `EPR_high_bin == 0` in all 23 years |
+| `ever_low` | Binary | `EPR_low_bin == 1` in at least one year |
+| `ever_high` | Binary | `EPR_high_bin == 1` in at least one year |
+| `mean_low_area_pct` | Continuous [0,1] | Mean of `EPR_low_pct` over 2000–2022 |
+| `mean_high_area_pct` | Continuous [0,1] | Mean of `EPR_high_pct` over 2000–2022 |
+| `mean_low_pop_pct` | Continuous [0,1] | Mean of `EPR_low_pop_pct` over 2000–2022 |
+| `mean_high_pop_pct` | Continuous [0,1] | Mean of `EPR_high_pop_pct` over 2000–2022 |
+| `mean_low_country_area_pct` | Continuous [0,1] | Mean of `EPR_low_country_area_pct` over 2000–2022 |
+| `mean_high_country_area_pct` | Continuous [0,1] | Mean of `EPR_high_country_area_pct` over 2000–2022 |
+| `mean_low_country_pop_pct` | Continuous [0,1] | Mean of `EPR_low_country_pop_pct` over 2000–2022 |
+| `mean_high_country_pop_pct` | Continuous [0,1] | Mean of `EPR_high_country_pop_pct` over 2000–2022 |
+
+```{r setup}
+if (!require("pacman")) install.packages("pacman", repos = "https://cran.r-project.org")
+
+pacman::p_load(
+  here,
+  tidyverse,
+  kableExtra,
+  scales,
+  sf,
+  patchwork,
+  biscale
+)
+
+panel <- readRDS(here::here("output", "adm2_epr_panel.rds"))
+cat("Panel loaded:", nrow(panel), "rows ×", ncol(panel), "cols\n")
+cat("Years:", paste(range(panel$year), collapse = "–"), "\n")
+cat("ADM-2 units:", n_distinct(panel$gid_adm2), "\n")
+
+# GADM name lookup
+gadm_names <- sf::st_read(
+  here::here("source", "gadm_410_adm2_clean.gpkg"),
+  quiet = TRUE
+) |>
+  sf::st_drop_geometry() |>
+  dplyr::select(gid_adm2, iso3, country, name_adm2)
+```
+
+---
+
+## Step 1: Binary Cross-Section Flags
+
+```{r binary-flags}
+n_years <- n_distinct(panel$year)
+
+cross_bin <- panel |>
+  group_by(gid_adm2) |>
+  summarise(
+    always_low  = as.integer(sum(EPR_low_bin)  == n_years),
+    always_high = as.integer(sum(EPR_high_bin) == n_years),
+    never_low   = as.integer(sum(EPR_low_bin)  == 0),
+    never_high  = as.integer(sum(EPR_high_bin) == 0),
+    ever_low    = as.integer(any(EPR_low_bin   == 1)),
+    ever_high   = as.integer(any(EPR_high_bin  == 1)),
+    .groups = "drop"
+  )
+
+tibble(
+  Variable = c("always_low", "always_high", "never_low", "never_high",
+               "ever_low", "ever_high"),
+  `n units` = c(sum(cross_bin$always_low), sum(cross_bin$always_high),
+                sum(cross_bin$never_low),  sum(cross_bin$never_high),
+                sum(cross_bin$ever_low),   sum(cross_bin$ever_high)),
+  `% units` = percent(c(mean(cross_bin$always_low), mean(cross_bin$always_high),
+                         mean(cross_bin$never_low),  mean(cross_bin$never_high),
+                         mean(cross_bin$ever_low),   mean(cross_bin$ever_high)), 0.1)
+) |>
+  kbl(caption = "Binary cross-section flags across 48,010 ADM-2 units",
+      align = c("l", "r", "r")) |>
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) |>
+  footnote(general = "always_* = flag is 1 in all 23 years; never_* = flag is 0 in all 23 years; ever_* = flag is 1 in at least one year.",
+           general_title = "Note:")
+```
+
+---
+
+## Step 2: Continuous Averages
+
+```{r continuous-means}
+cross_cont <- panel |>
+  group_by(gid_adm2) |>
+  summarise(
+    mean_low_area_pct          = mean(EPR_low_pct),
+    mean_high_area_pct         = mean(EPR_high_pct),
+    mean_low_pop_pct           = mean(EPR_low_pop_pct),
+    mean_high_pop_pct          = mean(EPR_high_pop_pct),
+    mean_low_country_area_pct  = mean(EPR_low_country_area_pct),
+    mean_high_country_area_pct = mean(EPR_high_country_area_pct),
+    mean_low_country_pop_pct   = mean(EPR_low_country_pop_pct),
+    mean_high_country_pop_pct  = mean(EPR_high_country_pop_pct),
+    .groups = "drop"
+  )
+
+tibble(
+  Variable = names(cross_cont)[-1],
+  Mean     = sapply(cross_cont[-1], mean)   |> round(5),
+  Median   = sapply(cross_cont[-1], median) |> round(5),
+  SD       = sapply(cross_cont[-1], sd)     |> round(5),
+  `% zero` = sapply(cross_cont[-1], \(x) percent(mean(x == 0), 0.1))
+) |>
+  kbl(caption = "Summary statistics for continuous cross-section variables",
+      align = c("l", "r", "r", "r", "r")) |>
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) |>
+  pack_rows("ADM-relative (area)",       1, 2) |>
+  pack_rows("ADM-relative (population)", 3, 4) |>
+  pack_rows("Country-relative (area)",    5, 6) |>
+  pack_rows("Country-relative (population)", 7, 8) |>
+  footnote(general = "Means are time-averages over 23 years (2000–2022) per ADM-2 unit, then summarised across all 48,010 units. % zero = share of units with a zero time-average (no EPR group presence in any year).",
+           general_title = "Note:")
+```
+
+---
+
+## Step 3: Assemble Cross-Section Dataset
+
+```{r assemble}
+crosssection <- cross_bin |>
+  left_join(cross_cont, by = "gid_adm2") |>
+  left_join(gadm_names,  by = "gid_adm2")
+
+cat("Cross-section dimensions:", nrow(crosssection), "units ×",
+    ncol(crosssection), "variables\n")
+cat("Columns:", paste(names(crosssection), collapse = ", "), "\n")
+```
+
+---
+
+## Step 4: Diagnostics
+
+```{r diag-binary}
+# Mutual exclusivity checks
+cat("=== Binary flag consistency ===\n")
+cat("always_low  & never_low  (impossible):",
+    sum(crosssection$always_low  & crosssection$never_low),  "\n")
+cat("always_high & never_high (impossible):",
+    sum(crosssection$always_high & crosssection$never_high), "\n")
+cat("always_low  implies ever_low  (must be 0 violations):",
+    sum(crosssection$always_low  & !crosssection$ever_low),  "\n")
+cat("always_high implies ever_high (must be 0 violations):",
+    sum(crosssection$always_high & !crosssection$ever_high), "\n")
+```
+
+```{r diag-continuous}
+#| fig-width: 10
+#| fig-height: 5
+#| fig-cap: "Distribution of mean unit-relative population share per ADM-2 unit (2000–2022). Left: share of units with exactly zero EPR overlap. Right: conditional distribution among non-zero units (log scale)."
+
+diag_df <- crosssection |>
+  select(mean_low_pop_pct, mean_high_pop_pct) |>
+  pivot_longer(everything(), names_to = "variable", values_to = "value") |>
+  mutate(variable = recode(variable,
+    mean_low_pop_pct  = "Low-power",
+    mean_high_pop_pct = "High-power"
+  ))
+
+# Panel A: zero-mass bar
+p_zero <- diag_df |>
+  group_by(variable) |>
+  summarise(pct_zero = mean(value == 0), .groups = "drop") |>
+  ggplot(aes(x = variable, y = pct_zero, fill = variable)) +
+  geom_col(width = 0.5, show.legend = FALSE) +
+  geom_text(aes(label = percent(pct_zero, accuracy = 0.1)),
+            vjust = -0.4, size = 3.5) +
+  scale_fill_brewer(palette = "Set2") +
+  scale_y_continuous(labels = percent, limits = c(0, 1),
+                     expand = expansion(mult = c(0, 0.1))) +
+  labs(x = NULL, y = "Share of ADM-2 units", title = "A. Share with zero overlap") +
+  theme_minimal(base_size = 12)
+
+# Panel B: non-zero density (log x-axis)
+p_nonzero <- diag_df |>
+  filter(value > 0) |>
+  ggplot(aes(x = value, colour = variable, fill = variable)) +
+  geom_density(alpha = 0.25, linewidth = 0.8) +
+  scale_x_log10(labels = percent) +
+  scale_colour_brewer(palette = "Set2", name = NULL) +
+  scale_fill_brewer(palette = "Set2", name = NULL) +
+  labs(x = "Mean unit-level population share (log scale)", y = "Density",
+       title = "B. Among non-zero units") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "top")
+
+patchwork::wrap_plots(p_zero, p_nonzero, widths = c(1, 2))
+```
+
+### Variable selection for cross-sectional analysis
+
+For subnational aid allocation studies using EPR as a proxy for political power, the
+recommended variable is **`mean_low_pop_pct`**, the unit-relative population share.
+It measures the average share of the ADM-2 unit's *own* population living inside
+low-power group territory over 2000–2022, capturing local exclusion intensity as a
+donor observer would perceive it on the ground.
+
+**Why unit-relative (`mean_low_pop_pct`) over country-relative (`mean_low_country_pop_pct`):**
+
+- `mean_low_pop_pct` answers: *how much of this district's population is politically
+  marginalized?* This is the relevant margin for local aid targeting decisions.
+- `mean_low_country_pop_pct` answers: *what share of the country's total population
+  does this district's marginalized population represent?* This is a national salience
+  measure, better suited for constructing country-level aggregates or instruments.
+- Country-relative values are mechanically tiny (ADM-2 pop / country pop is typically
+  < 0.01), compressing variation and producing near-zero distributions even within
+  EPR-coded countries.
+
+**Recommended specification:**
+
+| Variable | Role | Rationale |
+|---|---|---|
+| `mean_low_pop_pct` | Primary treatment | Intensity of low-power exposure in the unit |
+| `mean_high_pop_pct` | Control / heterogeneity | Dominant-group presence may independently predict aid |
+| `ever_low` | Binary alternative | Clean treated/control distinction if intensity not needed |
+
+```{r map-bivariate}
+#| fig-width: 11
+#| fig-height: 6
+#| fig-cap: "Bivariate choropleth: joint distribution of mean low-power and high-power unit-relative population shares at the ADM-2 level (2000–2022 average). Blue: high share of ADM-2 population inside low-power territory. Dark: high share inside high-power territory. Dark blue: coexistence. Light grey: no EPR group presence. Jenks natural breaks (dim = 3) per variable."
+
+# Load GADM ADM-2 geometry (geometry retained for mapping)
+adm2_sf <- sf::st_read(
+  here::here("source", "gadm_410_adm2_clean.gpkg"), quiet = TRUE
+) |>
+  dplyr::select(gid_adm2)
+
+# Join crosssection attributes to geometry.
+# Use unit-relative population shares (mean_low_pop_pct, mean_high_pop_pct):
+# these capture local exclusion intensity and vary meaningfully across units.
+# Country-relative shares (mean_low_country_pop_pct) are near-zero by construction
+# and add little visual information in a map.
+map_df <- adm2_sf |>
+  dplyr::left_join(
+    crosssection |>
+      dplyr::select(gid_adm2, mean_low_pop_pct, mean_high_pop_pct),
+    by = "gid_adm2"
+  )
+
+# Assign bivariate classes (3×3 grid per variable).
+# style = "jenks" (natural breaks) handles zero-inflated distributions:
+# quantile breaks fail here because most values are 0, causing non-unique cuts.
+map_biv <- biscale::bi_class(
+  map_df,
+  x     = mean_low_pop_pct,
+  y     = mean_high_pop_pct,
+  style = "jenks",
+  dim   = 3
+)
+
+# Map panel
+p_map <- ggplot(map_biv) +
+  geom_sf(aes(fill = bi_class), color = NA, show.legend = FALSE) +
+  biscale::bi_scale_fill(pal = "DkBlue", dim = 3) +
+  labs(
+    title    = "Low-power vs high-power group presence (bivariate)",
+    subtitle = "Mean share of ADM-2 population inside group territory, 2000–2022 average"
+  ) +
+  theme_void(base_size = 11) +
+  theme(plot.title = element_text(face = "bold"))
+
+# Legend panel
+p_legend <- biscale::bi_legend(
+  pal  = "DkBlue",
+  dim  = 3,
+  xlab = "Low-power ↑",
+  ylab = "High-power ↑",
+  size = 9
+)
+
+# Combine: wide map + compact legend
+patchwork::wrap_plots(p_map, p_legend, widths = c(4, 1))
+```
+
+---
+
+## Step 5: Export
+
+```{r export}
+out_path <- here::here("output", "adm2_epr_crosssection.rds")
+saveRDS(crosssection, out_path)
+cat("Saved:", out_path, "\n")
+cat("Dimensions:", nrow(crosssection), "rows ×", ncol(crosssection), "cols\n")
+
+sessionInfo()
+```
